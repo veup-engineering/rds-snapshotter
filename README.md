@@ -26,9 +26,25 @@ Runs directly in **AWS CloudShell** with no external dependencies beyond boto3.
     
 2.  Clone this repository or copy the script:
     
-    `git clone https://github.com/<your-repo>/rds-snapshot-all.git cd rds-snapshot-all` 
+    `git clone https://github.com/veup-engineering/rds-snapshotter.git`
+
+3.  Change into the RDS Snapshot directory:
+   
+   `cd rds-snapshotter`
+
+4.  Create a virtual environment:
+
+    `python3 -m venv rds-env`
+
+5.  Activate the virtual environment:
+
+    `source rds-env/bin/activate`
+
+6. Install boto3:
+
+    `pip install boto3`
     
-3.  Run the script:
+7.  Run the script:
     
     `python3 rds_snap_all.py` 
     
