@@ -30,7 +30,13 @@ parser.add_argument(
     "--tag",
     action="append",
     default=[],
-    help="Add tag Key=Value (can be specified multiple times)."
+    help="Add tag Key=Value to snapshots (can be specified multiple times)."
+)
+parser.add_argument(
+    "--filter-tag",
+    action="append", 
+    default=[],
+    help="Only snapshot RDS instances with this tag Key=Value (can be specified multiple times)."
 )
 args = parser.parse_args()
 
@@ -56,9 +62,9 @@ else:
         if r.get("OptInStatus") in (None, "opt-in-not-required", "opted-in")
     ]
 
-now_utc = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+now_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
 
-# Prepare tags
+# Prepare tags for snapshots
 tags = [{"Key": "CreatedBy", "Value": "CloudShellScript"},
         {"Key": "AccountId", "Value": account}]
 for t in args.tag:
@@ -67,12 +73,45 @@ for t in args.tag:
         if k:
             tags.append({"Key": k, "Value": v})
 
+# Prepare filter tags
+filter_tags = {}
+for t in args.filter_tag:
+    if "=" in t:
+        k, v = t.split("=", 1)
+        if k:
+            filter_tags[k] = v
+
+def get_resource_tags(rds_client, resource_arn: str) -> Dict[str, str]:
+    """Get tags for an RDS resource."""
+    try:
+        resp = rds_client.list_tags_for_resource(ResourceName=resource_arn)
+        return {tag["Key"]: tag["Value"] for tag in resp.get("TagList", [])}
+    except ClientError as e:
+        print(f"Warning: Could not get tags for {resource_arn}: {e}")
+        return {}
+
+def matches_filter_tags(resource_tags: Dict[str, str], filter_tags: Dict[str, str]) -> bool:
+    """Check if resource tags match all filter criteria."""
+    if not filter_tags:
+        return True  # No filters means include all
+    
+    for key, value in filter_tags.items():
+        if resource_tags.get(key) != value:
+            return False
+    return True
+
 def tag_arn_for_snapshot(region: str, snapshot_id: str, cluster: bool) -> str:
     # RDS snapshot ARNs:
     #   db snapshot: arn:aws:rds:<region>:<acct>:snapshot:<snapshot-id>
     #   cluster snapshot: arn:aws:rds:<region>:<acct>:cluster-snapshot:<snapshot-id>
     snap_type = "cluster-snapshot" if cluster else "snapshot"
     return f"arn:aws:rds:{region}:{account}:{snap_type}:{snapshot_id}"
+
+def db_instance_arn(region: str, db_id: str) -> str:
+    return f"arn:aws:rds:{region}:{account}:db:{db_id}"
+
+def db_cluster_arn(region: str, cluster_id: str) -> str:
+    return f"arn:aws:rds:{region}:{account}:cluster:{cluster_id}"
 
 created = []
 skipped = []
@@ -82,6 +121,9 @@ errors = []
 for region in regions:
     rds = session.client("rds", region_name=region, config=cfg)
     print(f"\n=== Region: {region} ===")
+    
+    if filter_tags:
+        print(f"Filtering for tags: {filter_tags}")
 
     # Collect DB instances
     instances: List[Dict] = []
@@ -103,15 +145,37 @@ for region in regions:
             skipped.append((region, inst["DBInstanceIdentifier"], "read-replica"))
             continue
 
+        # Check if instance matches filter tags
+        if filter_tags:
+            inst_arn = db_instance_arn(region, inst["DBInstanceIdentifier"])
+            inst_tags = get_resource_tags(rds, inst_arn)
+            if not matches_filter_tags(inst_tags, filter_tags):
+                skipped.append((region, inst["DBInstanceIdentifier"], "tag-filter-mismatch"))
+                print(f"• Skipped {inst['DBInstanceIdentifier']}: doesn't match tag filter")
+                continue
+
         if inst.get("DBClusterIdentifier"):
             cluster_ids.add(inst["DBClusterIdentifier"])
         else:
             standalone_instances.append(inst)
 
+    # For clusters, we also need to check cluster-level tags
+    filtered_cluster_ids = set()
+    if cluster_ids and filter_tags:
+        for cid in cluster_ids:
+            cluster_arn = db_cluster_arn(region, cid)
+            cluster_tags = get_resource_tags(rds, cluster_arn)
+            if matches_filter_tags(cluster_tags, filter_tags):
+                filtered_cluster_ids.add(cid)
+            else:
+                skipped.append((region, cid, "cluster-tag-filter-mismatch"))
+                print(f"• Skipped cluster {cid}: doesn't match tag filter")
+    else:
+        filtered_cluster_ids = cluster_ids
+
     # Create cluster snapshots (one per DBClusterIdentifier)
-    if cluster_ids:
-        # We need cluster engine check just for info; snapshot API is cluster-level
-        for cid in sorted(cluster_ids):
+    if filtered_cluster_ids:
+        for cid in sorted(filtered_cluster_ids):
             snap_id = f"{args.prefix}-cluster-{cid}-{now_utc}"
             try:
                 resp = rds.create_db_cluster_snapshot(
